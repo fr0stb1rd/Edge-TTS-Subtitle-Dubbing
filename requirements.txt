@@ -1,0 +1,7 @@
+edge-tts
+pysrt
+librosa
+soundfile
+audiostretchy
+numpy
+tqdm
