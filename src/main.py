@@ -205,10 +205,10 @@ async def generate_audio_segment(text: str, output_file: str, voice: str, rate: 
         except Exception as e:
             if i < retries:
                 wait_time = (i + 1) * random.uniform(1, 3)
-                logger.warning(f"Connection error, retrying in {wait_time:.1f}s... ({i+1}/{retries})")
+                logger.warning(f"Connection error for TTS ('{text}'), retrying in {wait_time:.1f}s... ({i+1}/{retries}) | Error: {e}")
                 await asyncio.sleep(wait_time)
             else:
-                logger.error(f"Failed to generate audio after {retries} retries: {e}")
+                logger.error(f"Failed to generate audio for ('{text}') after {retries} retries: {e}")
                 raise e
 
 
