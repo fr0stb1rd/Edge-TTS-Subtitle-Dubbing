@@ -462,6 +462,8 @@ def srt_to_audio_numpy(
     
     for i, sub in enumerate(subs):
         text = sub.text.replace('\n', ' ').strip()
+        if text == "...":
+            text = ""
         if not text:
             stats['empty'] += 1
             continue
@@ -532,6 +534,8 @@ def srt_to_audio_numpy(
     logger.info("Copying cached audio to segment locations...")
     for i, sub in enumerate(subs):
         text = sub.text.replace('\n', ' ').strip()
+        if text == "...":
+            text = ""
         if not text:
             continue
             
@@ -561,6 +565,8 @@ def srt_to_audio_numpy(
         end_sec = time_str_to_seconds(sub.end)
         target_span_sec = end_sec - start_sec
         text = sub.text.replace('\n', ' ').strip()
+        if text == "...":
+            text = ""
         
         # 1. Handle Pre-Gap (Silence before this sub)
         current_head_sec = current_total_samples / SAMPLE_RATE
