@@ -255,23 +255,36 @@ async def generate_audio_batch(
     
     return all_results
 
-def adjust_audio_length(
-    wav_path: str, 
-    desired_length: float, 
-    sample_rate: int = SAMPLE_RATE, 
-    max_speed_factor: float = 1.5
+def _exact_sample_length(
+    y: npt.NDArray[np.float32], target_samples: int
+) -> npt.NDArray[np.float32]:
+    """Trim or zero-pad to an exact sample count (keeps the timeline aligned)."""
+    if target_samples <= 0:
+        return np.zeros(0, dtype=np.float32)
+    if len(y) < target_samples:
+        return np.pad(y, (0, target_samples - len(y)), mode="constant").astype(np.float32)
+    return y[:target_samples].astype(np.float32)
+
+
+def _adjust_audio_length_upstream_compat(
+    wav_path: str,
+    desired_length: float,
+    sample_rate: int = SAMPLE_RATE,
+    max_speed_factor: float = 1.5,
 ) -> npt.NDArray[np.float32]:
     """Adjusts audio file to desired length using audiostretchy time-stretching.
-    
+
+    Mirrors upstream Edge-TTS-Subtitle-Dubbing ``adjust_audio_length`` (legacy).
+
     Args:
         wav_path: Path to input audio file (MP3 or WAV)
         desired_length: Target duration in seconds
         sample_rate: Audio sample rate in Hz
         max_speed_factor: Maximum speed-up factor (e.g., 2.0 = 2x speed)
-        
+
     Returns:
         Adjusted audio as numpy float32 array at specified sample rate
-        
+
     Note:
         Uses high-quality time-stretching algorithm. Automatically cleans up
         temporary files. Returns original audio if stretching fails.
@@ -284,7 +297,7 @@ def adjust_audio_length(
         return np.zeros(0, dtype=np.float32)
 
     current_length = len(y) / sample_rate
-    
+
     if desired_length <= 0:
         return y
 
@@ -292,35 +305,38 @@ def adjust_audio_length(
     # audiostretchy ratio: >1 slows down, <1 speeds up
     # ratio = desired_duration / current_duration
     ratio = desired_length / current_length
-    
+
     # Clamp ratio to prevent excessive speed-up
     # max_speed 2.0x means minimum ratio of 0.5
     min_ratio = 1.0 / max_speed_factor
     if ratio < min_ratio:
         ratio = min_ratio
-        logger.warning(f"  Clamped max speed: Ratio {ratio:.3f} (Req: {desired_length:.2f}s from {current_length:.2f}s)")
-    
+        logger.warning(
+            f"  Clamped max speed: Ratio {ratio:.3f} "
+            f"(Req: {desired_length:.2f}s from {current_length:.2f}s)"
+        )
+
     input_tmp = wav_path
     output_tmp = wav_path.replace(".mp3", "_stretched.wav").replace(".wav", "_stretched.wav")
-    
+
     try:
         stretch_audio(input_tmp, output_tmp, ratio=ratio, sample_rate=sample_rate)
         # Load the result
         y_stretched, _ = librosa.load(output_tmp, sr=sample_rate)
-        
+
         # Trim or Pad to EXACT desired sample count to avoid drift
         target_samples = int(desired_length * sample_rate)
-        
+
         if len(y_stretched) < target_samples:
             # Pad
             padding = target_samples - len(y_stretched)
-            y_stretched = np.pad(y_stretched, (0, padding), 'constant')
+            y_stretched = np.pad(y_stretched, (0, padding), "constant")
         elif len(y_stretched) > target_samples:
             # Crop
             y_stretched = y_stretched[:target_samples]
-            
+
         return y_stretched
-        
+
     except Exception as e:
         logger.error(f"Stretching failed: {e}")
         return y
@@ -331,6 +347,117 @@ def adjust_audio_length(
                 os.remove(output_tmp)
             except Exception as e:
                 logger.warning(f"Failed to remove temp file {output_tmp}: {e}")
+
+
+def _adjust_audio_length_exact_slot(
+    wav_path: str,
+    desired_length: float,
+    sample_rate: int = SAMPLE_RATE,
+    max_speed_factor: float = 1.5,
+) -> npt.NDArray[np.float32]:
+    """Adjusts audio to cue slot length: audiostretchy first, then strict trim/pad.
+
+    Extension for edge-tts-dubbing-api: always returns audio of exactly
+    ``int(desired_length * sample_rate)`` samples so the global timeline does not
+    drift when audiostretchy fails (upstream returned the full raw clip).
+
+    Args:
+        wav_path: Path to input audio file (MP3 or WAV)
+        desired_length: Target duration in seconds
+        sample_rate: Audio sample rate in Hz
+        max_speed_factor: Maximum speed-up factor (e.g., 2.0 = 2x speed)
+
+    Returns:
+        Adjusted audio as numpy float32 array at specified sample rate
+
+    Note:
+        Primary path uses audiostretchy (same ratio semantics as upstream).
+        On stretch failure, falls back to ``librosa.effects.time_stretch`` capped
+        by ``max_speed_factor``, then trim/pad to exact sample count.
+    """
+    target_samples = int(desired_length * sample_rate)
+
+    try:
+        # Load original
+        y, _sr = librosa.load(wav_path, sr=sample_rate)
+    except Exception as e:
+        logger.error(f"Failed to load {wav_path}: {e}")
+        # Silence of slot length so the outer timeline does not stall on empty audio
+        return _exact_sample_length(np.zeros(0, dtype=np.float32), target_samples)
+
+    current_length = len(y) / sample_rate
+
+    if desired_length <= 0:
+        return np.zeros(0, dtype=np.float32)
+
+    # Calculate time-stretching ratio
+    # audiostretchy ratio: >1 slows down, <1 speeds up
+    # ratio = desired_duration / current_duration
+    ratio = desired_length / current_length
+
+    # Clamp ratio to prevent excessive speed-up
+    # max_speed 2.0x means minimum ratio of 0.5
+    min_ratio = 1.0 / max_speed_factor
+    if ratio < min_ratio:
+        ratio = min_ratio
+        logger.warning(
+            f"  Clamped max speed: Ratio {ratio:.3f} "
+            f"(Req: {desired_length:.2f}s from {current_length:.2f}s)"
+        )
+
+    stem = Path(wav_path).stem
+    parent = Path(wav_path).parent
+    output_tmp = str(parent / f"{stem}_audiostretch.wav")
+
+    def fallback_librosa_time_stretch() -> npt.NDArray[np.float32]:
+        # librosa: rate > 1 speeds up (shorter output). Target duration ~= current_length / rate
+        rate = current_length / desired_length
+        rate = float(min(max(rate, 1e-6), max_speed_factor))
+        try:
+            y2 = librosa.effects.time_stretch(np.asarray(y, dtype=np.float32), rate=rate)
+            return _exact_sample_length(y2.astype(np.float32), target_samples)
+        except Exception as e2:
+            logger.error(f"librosa.effects.time_stretch fallback failed: {e2}")
+            return np.zeros(target_samples, dtype=np.float32)
+
+    try:
+        stretch_audio(wav_path, output_tmp, ratio=ratio, sample_rate=sample_rate)
+        y_stretched, _ = librosa.load(output_tmp, sr=sample_rate)
+        # Trim or Pad to EXACT desired sample count to avoid drift
+        return _exact_sample_length(y_stretched.astype(np.float32), target_samples)
+    except Exception as e:
+        logger.error(f"audiostretchy failed ({e}); using librosa time_stretch fallback")
+        return fallback_librosa_time_stretch()
+    finally:
+        # Clean up temporary stretched file
+        if os.path.exists(output_tmp):
+            try:
+                os.remove(output_tmp)
+            except Exception as e:
+                logger.warning(f"Failed to remove temp file {output_tmp}: {e}")
+
+
+def adjust_audio_length(
+    wav_path: str,
+    desired_length: float,
+    sample_rate: int = SAMPLE_RATE,
+    max_speed_factor: float = 1.5,
+    *,
+    enable_exact_duration_text_stretching: bool = False,
+) -> npt.NDArray[np.float32]:
+    """Dispatch: legacy upstream stretch behavior vs exact-slot + librosa fallback.
+
+    When ``enable_exact_duration_text_stretching`` is False, matches upstream
+    (including returning the full raw clip if audiostretchy fails). When True,
+    every segment is forced to the cue duration so the mix length tracks SRT.
+    """
+    if enable_exact_duration_text_stretching:
+        return _adjust_audio_length_exact_slot(
+            wav_path, desired_length, sample_rate, max_speed_factor
+        )
+    return _adjust_audio_length_upstream_compat(
+        wav_path, desired_length, sample_rate, max_speed_factor
+    )
 
 def srt_to_audio_numpy(
     srt_path: str,
@@ -346,7 +473,8 @@ def srt_to_audio_numpy(
     log_level: str = "INFO",
     no_concat: bool = False,
     batch_size: int = 10,
-    retries: int = 10
+    retries: int = 10,
+    enable_exact_duration_text_stretching: bool = False,
 ) -> None:
     """Convert SRT subtitles to synchronized audio using Edge TTS.
     
@@ -367,7 +495,9 @@ def srt_to_audio_numpy(
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
         no_concat: If True, generate segments only without final merge
         batch_size: Number of concurrent TTS requests (default: 10)
-        
+        enable_exact_duration_text_stretching: If True, force exact slot length and
+            librosa fallback when audiostretchy fails (API flag).
+
     Returns:
         None. Outputs audio file to output_path (unless no_concat is True).
     """
@@ -423,7 +553,11 @@ def srt_to_audio_numpy(
         return
     
     logger.info(f"Loaded {len(subs)} subtitle entries")
-    
+    if enable_exact_duration_text_stretching:
+        logger.info("Exact-duration text stretching: ON (strict slot + librosa fallback)")
+    else:
+        logger.info("Exact-duration text stretching: OFF (upstream stretch / raw-on-fail)")
+
     # Use a list to store chunks, avoiding O(N^2) copying
     audio_segments = []
     current_total_samples = 0
@@ -619,10 +753,11 @@ def srt_to_audio_numpy(
         
         # Adjust audio
         stretched_wav = adjust_audio_length(
-            raw_audio_path, 
-            target_dur_for_segment, 
-            sample_rate=SAMPLE_RATE, 
-            max_speed_factor=max_speed
+            raw_audio_path,
+            target_dur_for_segment,
+            sample_rate=SAMPLE_RATE,
+            max_speed_factor=max_speed,
+            enable_exact_duration_text_stretching=enable_exact_duration_text_stretching,
         )
         
         audio_segments.append(stretched_wav)
@@ -731,7 +866,12 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=10, help="Number of concurrent TTS requests (default: 10)")
     parser.add_argument("--retries", type=int, default=10, help="Number of retry attempts for network failures (default: 10)")
     parser.add_argument("--format", choices=['wav', 'm4a', 'opus'], default=None, help="Output format (wav, m4a, opus). Overrides filename extension if specified.")
-    
+    parser.add_argument(
+        "--enable-exact-duration-text-stretching",
+        action="store_true",
+        help="Force each TTS segment to exact cue length; librosa fallback if audiostretchy fails.",
+    )
+
     args = parser.parse_args()
     
     # Auto-generate log file path if not specified
@@ -763,5 +903,6 @@ if __name__ == "__main__":
         log_level=args.log_level,
         no_concat=args.no_concat,
         batch_size=args.batch_size,
-        retries=args.retries
+        retries=args.retries,
+        enable_exact_duration_text_stretching=args.enable_exact_duration_text_stretching,
     )
